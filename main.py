@@ -58,7 +58,6 @@ def get_history():
             vol_avg = float(vol.rolling(20).mean().iloc[-1]) if vol is not None and len(vol)>=20 else 0
             vol_now = float(vol.iloc[-1]) if vol is not None else 0
 
-            # V11 KOYEB FIX: Yahoo sometimes returns 0 volume
             if vol_avg == 0 or vol_now == 0 or pd.isna(vol_avg) or pd.isna(vol_now):
                 vol_ok = True
                 vol_avg = 200
@@ -73,37 +72,71 @@ def get_history():
             time.sleep(40)
     return None
 
+# NEW: 1H TREND FILTER
+def get_htf_trend(fut_price):
+    try:
+        df = yf.download("GC=F", period="7d", interval="1h", progress=False, auto_adjust=True, threads=False)
+        if df.empty: return True, True  # fail-open so bot doesn't stall
+        if isinstance(df.columns, pd.MultiIndex): df.columns = df.columns.get_level_values(0)
+        close = df['Close'].dropna()
+        if len(close) < 50: return True, True
+        ema200_1h = float(ta.trend.ema_indicator(close, window=200).iloc[-1] if len(close)>=200 else ta.trend.ema_indicator(close, window=50).iloc[-1])
+        # fut_price is used here because 1H EMA is on futures, compare like-for-like
+        return fut_price > ema200_1h, fut_price < ema200_1h
+    except Exception as e:
+        print(f"HTF FAIL {e}", flush=True)
+        return True, True
+
 def get_data():
     spot = get_spot_price()
     hist = get_history()
     if hist is None: return None
     if spot is None: spot = hist["fut_price"] - 18.0
     premium = hist["fut_price"] - spot
-    return {"price":spot,"fut_price":hist["fut_price"],"ema9":hist["ema9"]-premium,"ema20":hist["ema20"]-premium,"ema21":hist["ema21"]-premium,"ema200":hist["ema200"]-premium,"rsi":hist["rsi"],"roc":hist["roc"],"vol_ok":hist["vol_ok"],"vol_now":hist["vol_now"],"vol_avg":hist["vol_avg"],"ema9_slope_up":hist["ema9_slope_up"],"ema9_slope_down":hist["ema9_slope_down"]}
+    htf_buy, htf_sell = get_htf_trend(hist["fut_price"])
+    return {"price":spot,"fut_price":hist["fut_price"],"ema9":hist["ema9"]-premium,"ema20":hist["ema20"]-premium,"ema21":hist["ema21"]-premium,"ema200":hist["ema200"]-premium,"rsi":hist["rsi"],"roc":hist["roc"],"vol_ok":hist["vol_ok"],"vol_now":hist["vol_now"],"vol_avg":hist["vol_avg"],"ema9_slope_up":hist["ema9_slope_up"],"ema9_slope_down":hist["ema9_slope_down"],"htf_buy":htf_buy,"htf_sell":htf_sell}
 
 def check_market():
     global last_price, last_rsi, last_check, active_trade
-    print("MARKET V11 KOYEB FIX STARTED", flush=True)
+    print("MARKET V12 RSI 40-55 + BE + HTF STARTED", flush=True)
     while True:
         try:
             d = get_data()
             if d is None: time.sleep(120); continue
             price = d["price"]; ema9=d["ema9"]; ema20=d["ema20"]; ema21=d["ema21"]; ema200=d["ema200"]; rsi=d["rsi"]; roc=d["roc"]
             last_price=price; last_rsi=rsi; last_check=time.strftime("%H:%M:%S")
-            print(f"CHECK {price:.2f} RSI {rsi:.1f} ROC {roc:.4f} VOL {d['vol_now']:.0f}/{d['vol_avg']:.0f} OK={d['vol_ok']}", flush=True)
+            print(f"CHECK {price:.2f} RSI {rsi:.1f} ROC {roc:.4f} VOL {d['vol_now']:.0f}/{d['vol_avg']:.0f} OK={d['vol_ok']} HTF B={d['htf_buy']} S={d['htf_sell']}", flush=True)
 
             if active_trade:
                 entry=active_trade["entry"]
+                # NEW: BREAKEVEN AT +0.3%
+                if not active_trade.get("be", False):
+                    if active_trade["dir"]=="BUY" and price >= entry*1.003:
+                        active_trade["sl"] = entry
+                        active_trade["be"] = True
+                        send_tg(f"🔒 <b>BREAKEVEN BUY</b>\nEntry {entry:.2f} -> SL moved to entry\nPrice {price:.2f}\nWorst case now $0")
+                    elif active_trade["dir"]=="SELL" and price <= entry*0.997:
+                        active_trade["sl"] = entry
+                        active_trade["be"] = True
+                        send_tg(f"🔒 <b>BREAKEVEN SELL</b>\nEntry {entry:.2f} -> SL moved to entry\nPrice {price:.2f}\nWorst case now $0")
+
                 if active_trade["dir"]=="BUY":
                     if price>=active_trade["tp"]:
                         if send_tg(f"✅ <b>TP HIT BUY</b>\n{entry:.2f} -> {price:.2f}"): active_trade=None
                     elif price<=active_trade["sl"]:
-                        if send_tg(f"❌ <b>SL HIT BUY</b>\n{entry:.2f} -> {price:.2f}"): active_trade=None
+                        # If BE hit, label it BE not SL
+                        if active_trade.get("be", False) and abs(price-entry) < 0.5:
+                            if send_tg(f"➖ <b>BREAKEVEN HIT BUY</b>\n{entry:.2f} -> {price:.2f} ($0)"): active_trade=None
+                        else:
+                            if send_tg(f"❌ <b>SL HIT BUY</b>\n{entry:.2f} -> {price:.2f}"): active_trade=None
                 else:
                     if price<=active_trade["tp"]:
                         if send_tg(f"✅ <b>TP HIT SELL</b>\n{entry:.2f} -> {price:.2f}"): active_trade=None
                     elif price>=active_trade["sl"]:
-                        if send_tg(f"❌ <b>SL HIT SELL</b>\n{entry:.2f} -> {price:.2f}"): active_trade=None
+                        if active_trade.get("be", False) and abs(price-entry) < 0.5:
+                            if send_tg(f"➖ <b>BREAKEVEN HIT SELL</b>\n{entry:.2f} -> {price:.2f} ($0)"): active_trade=None
+                        else:
+                            if send_tg(f"❌ <b>SL HIT SELL</b>\n{entry:.2f} -> {price:.2f}"): active_trade=None
                 if active_trade: time.sleep(90); continue
 
             dist_200 = abs(price-ema200)/price*100
@@ -111,28 +144,30 @@ def check_market():
             sell_stack = (ema9 < ema20 < ema21 < ema200) and (price < ema9)
             if abs(roc) < 0.004: print("FLAT SKIP", flush=True); time.sleep(90); continue
 
-            buy_rsi = 40 < rsi < 68
-            sell_rsi = 32 < rsi < 58
+            # CHANGED: RSI 40-55 BUY, 45-60 SELL
+            buy_rsi = 40 < rsi < 55
+            sell_rsi = 45 < rsi < 60
             dist_ok = 0.05 < dist_200 < 1.5
             buy_mom_vol = (roc > 0.01) and (d["vol_ok"] or roc > 0.03) and d["ema9_slope_up"]
             sell_mom_vol = (roc < -0.01) and (d["vol_ok"] or roc < -0.03) and d["ema9_slope_down"]
             buy_trend = price > ema20
             sell_trend = price < ema20
 
-            buy_filters = [("STACK 9>20>21>200 & P>9" if buy_stack else "STACK FAIL", buy_stack),(f"RSI {rsi:.1f} in 40-68" if buy_rsi else f"RSI {rsi:.1f} BAD", buy_rsi),(f"Dist {dist_200:.2f}% OK" if dist_ok else f"Dist {dist_200:.2f}% BAD", dist_ok),(f"MOM {roc:.3f}%+VOL OK" if buy_mom_vol else f"MOM/VOL FAIL {roc:.3f}%", buy_mom_vol),("Price>EMA20" if buy_trend else "Trend FAIL", buy_trend)]
-            sell_filters = [("STACK 9<20<21<200 & P<9" if sell_stack else "STACK FAIL", sell_stack),(f"RSI {rsi:.1f} in 32-58" if sell_rsi else f"RSI {rsi:.1f} BAD", sell_rsi),(f"Dist {dist_200:.2f}% OK" if dist_ok else f"Dist {dist_200:.2f}% BAD", dist_ok),(f"MOM {roc:.3f}%+VOL OK" if sell_mom_vol else f"MOM/VOL FAIL {roc:.3f}%", sell_mom_vol),("Price<EMA20" if sell_trend else "Trend FAIL", sell_trend)]
+            # NEW: 6 filters now, need 5/6 + stack + HTF
+            buy_filters = [("STACK 9>20>21>200 & P>9" if buy_stack else "STACK FAIL", buy_stack),(f"RSI {rsi:.1f} in 40-55" if buy_rsi else f"RSI {rsi:.1f} BAD", buy_rsi),(f"Dist {dist_200:.2f}% OK" if dist_ok else f"Dist {dist_200:.2f}% BAD", dist_ok),(f"MOM {roc:.3f}%+VOL OK" if buy_mom_vol else f"MOM/VOL FAIL {roc:.3f}%", buy_mom_vol),("Price>EMA20" if buy_trend else "Trend FAIL", buy_trend),("1H Above EMA200" if d["htf_buy"] else "1H FAIL", d["htf_buy"])]
+            sell_filters = [("STACK 9<20<21<200 & P<9" if sell_stack else "STACK FAIL", sell_stack),(f"RSI {rsi:.1f} in 45-60" if sell_rsi else f"RSI {rsi:.1f} BAD", sell_rsi),(f"Dist {dist_200:.2f}% OK" if dist_ok else f"Dist {dist_200:.2f}% BAD", dist_ok),(f"MOM {roc:.3f}%+VOL OK" if sell_mom_vol else f"MOM/VOL FAIL {roc:.3f}%", sell_mom_vol),("Price<EMA20" if sell_trend else "Trend FAIL", sell_trend),("1H Below EMA200" if d["htf_sell"] else "1H FAIL", d["htf_sell"])]
 
             buy_score = sum(1 for _,ok in buy_filters if ok)
             sell_score = sum(1 for _,ok in sell_filters if ok)
 
-            if buy_score >=4 and buy_stack:
+            if buy_score >=5 and buy_stack and d["htf_buy"]:
                 tp=price*1.006; sl=price*0.997
                 details="\n".join([f"{'✅' if ok else '❌'} {name}" for name,ok in buy_filters])
-                if send_tg(f"🟢 <b>BUY 4/5 REAL</b>\nSPOT {price:.2f} FUT {d['fut_price']:.2f}\nEntry {price:.2f}\nTP {tp:.2f} (+0.6%)\nSL {sl:.2f} (-0.3%)\n\n{details}\nScore {buy_score}/5"): active_trade={"dir":"BUY","entry":price,"tp":tp,"sl":sl}
-            elif sell_score >=4 and sell_stack:
+                if send_tg(f"🟢 <b>BUY 5/6 REAL</b>\nSPOT {price:.2f} FUT {d['fut_price']:.2f}\nEntry {price:.2f}\nTP {tp:.2f} (+0.6%)\nSL {sl:.2f} (-0.3%)\nBE at +0.3%\n\n{details}\nScore {buy_score}/6"): active_trade={"dir":"BUY","entry":price,"tp":tp,"sl":sl,"be":False}
+            elif sell_score >=5 and sell_stack and d["htf_sell"]:
                 tp=price*0.994; sl=price*1.003
                 details="\n".join([f"{'✅' if ok else '❌'} {name}" for name,ok in sell_filters])
-                if send_tg(f"🔴 <b>SELL 4/5 REAL</b>\nSPOT {price:.2f} FUT {d['fut_price']:.2f}\nEntry {price:.2f}\nTP {tp:.2f} (-0.6%)\nSL {sl:.2f} (+0.3%)\n\n{details}\nScore {sell_score}/5"): active_trade={"dir":"SELL","entry":price,"tp":tp,"sl":sl}
+                if send_tg(f"🔴 <b>SELL 5/6 REAL</b>\nSPOT {price:.2f} FUT {d['fut_price']:.2f}\nEntry {price:.2f}\nTP {tp:.2f} (-0.6%)\nSL {sl:.2f} (+0.3%)\nBE at -0.3%\n\n{details}\nScore {sell_score}/6"): active_trade={"dir":"SELL","entry":price,"tp":tp,"sl":sl,"be":False}
             time.sleep(120)
         except Exception as e:
             print(f"ERR {e}", flush=True); time.sleep(60)
@@ -148,12 +183,12 @@ def telegram_loop():
                 text=upd.get("message",{}).get("text",""); chat=str(upd.get("message",{}).get("chat",{}).get("id",""))
                 if chat!=CHAT_ID: continue
                 if "/status" in text or "/start" in text:
-                    tr="No trade" if not active_trade else f"{active_trade['dir']} {active_trade['entry']:.2f}"
-                    send_tg(f"✅ <b>V11 KOYEB LIVE</b>\nSPOT {last_price:.2f}\n{tr}\nLast {last_check}")
+                    tr="No trade" if not active_trade else f"{active_trade['dir']} {active_trade['entry']:.2f} BE={active_trade.get('be',False)}"
+                    send_tg(f"✅ <b>V12 LIVE</b>\nSPOT {last_price:.2f}\n{tr}\nLast {last_check}")
         except: time.sleep(3)
 
 @app.route("/")
-def home(): return f"V11 KOYEB {last_price} {last_check}"
+def home(): return f"V12 {last_price} {last_check}"
 
 threading.Thread(target=telegram_loop, daemon=True).start()
 threading.Thread(target=check_market, daemon=True).start()
