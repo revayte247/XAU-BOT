@@ -8,12 +8,13 @@ import numpy as np
 from flask import Flask
 from datetime import datetime
 
-VERSION = "V12.3 LIVE"
+VERSION = "V12.4 LIVE"
 # FIX: Accept BOTH env var names
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "") or os.getenv("TELEGRAM_BOT_TOKEN", "") or os.getenv("BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "") or os.getenv("TELEGRAM_BOT_CHAT_ID", "") or os.getenv("CHAT_ID", "")
 
-SYMBOL = "XAUUSD=X"
+SYMBOL = "GC=F"
+SPOT_OFFSET = 10.0  # GC=F Futures is ~$10 above XAUUSD Spot, subtract it to match broker
 CHECK_INTERVAL = 120
 
 BUY_RSI_MIN = 30
@@ -69,7 +70,9 @@ def check_trade():
         return
     close5 = df5["Close"]
     vol = df5["Volume"]
-    price = float(close5.iloc[-1])
+    # Convert Futures price to Spot price
+    price_raw = float(close5.iloc[-1])
+    price = price_raw - SPOT_OFFSET
     rsi = float(get_rsi(close5, 14).iloc[-1])
     roc = float((close5.iloc[-1] - close5.iloc[-4]) / close5.iloc[-4] * 100) if len(close5) > 4 else 0
     vol_now = float(vol.iloc[-1]) if len(vol) > 0 else 0
@@ -77,12 +80,12 @@ def check_trade():
     vol_ok = vol_now >= vol_avg * 0.5
     vol_thresh = int(vol_avg)
     df1h["EMA200"] = df1h["Close"].ewm(span=200, adjust=False).mean()
-    ema200_1h = float(df1h["EMA200"].iloc[-1])
+    ema200_1h = float(df1h["EMA200"].iloc[-1]) - SPOT_OFFSET
     htf_buy = price > ema200_1h
     htf_sell = price < ema200_1h
     stats["last_check"] = datetime.utcnow().strftime("%H:%M:%S")
     stats["last_price"] = price
-    print(f"CHECK {price:.2f} RSI {rsi:.1f} ROC {roc:.4f} VOL {int(vol_now)}/{vol_thresh} OK={vol_ok} HTF B={htf_buy} S={htf_sell}", flush=True)
+    print(f"CHECK {price:.2f} (GC {price_raw:.2f} - {SPOT_OFFSET}) RSI {rsi:.1f} ROC {roc:.4f} VOL {int(vol_now)}/{vol_thresh} OK={vol_ok} HTF B={htf_buy} S={htf_sell}", flush=True)
 
     if stats["open_trade"]:
         t = stats["open_trade"]
@@ -113,17 +116,17 @@ def check_trade():
         sl_price = price - SL_PIPS
         be_price = price + BE_TRIGGER
         stats["open_trade"] = {"side": "BUY", "entry": price, "be_done": False}
-        send_telegram(f"🟢 BUY SIGNAL V12.3\nPrice {price:.2f} RSI {rsi:.1f} HTF B={htf_buy}\nTP: {tp_price:.2f} (+{TP_PIPS})\nSL: {sl_price:.2f} (-{SL_PIPS})\nBE: {be_price:.2f} (+{BE_TRIGGER} then to breakeven)")
+        send_telegram(f"🟢 BUY SIGNAL V12.4\nPrice {price:.2f} RSI {rsi:.1f} HTF B={htf_buy}\nTP: {tp_price:.2f} (+{TP_PIPS})\nSL: {sl_price:.2f} (-{SL_PIPS})\nBE: {be_price:.2f} (+{BE_TRIGGER} then to breakeven)")
     elif sell_signal:
         tp_price = price - TP_PIPS
         sl_price = price + SL_PIPS
         be_price = price - BE_TRIGGER
         stats["open_trade"] = {"side": "SELL", "entry": price, "be_done": False}
-        send_telegram(f"🔴 SELL SIGNAL V12.3\nPrice {price:.2f} RSI {rsi:.1f} HTF S={htf_sell}\nTP: {tp_price:.2f} (+{TP_PIPS})\nSL: {sl_price:.2f} (-{SL_PIPS})\nBE: {be_price:.2f} (+{BE_TRIGGER} then to breakeven)")
+        send_telegram(f"🔴 SELL SIGNAL V12.4\nPrice {price:.2f} RSI {rsi:.1f} HTF S={htf_sell}\nTP: {tp_price:.2f} (+{TP_PIPS})\nSL: {sl_price:.2f} (-{SL_PIPS})\nBE: {be_price:.2f} (+{BE_TRIGGER} then to breakeven)")
 
 def bot_loop():
     time.sleep(5)
-    send_telegram(f"🤖 XAU BOT {VERSION}\nNo trade - Waiting for setup\nRSI BUY {BUY_RSI_MIN}-{BUY_RSI_MAX} | SELL {SELL_RSI_MIN}-{SELL_RSI_MAX}\nHTF: 1H EMA200\nTP +{TP_PIPS} / SL -{SL_PIPS} = 1:2 RR\nPrice source: XAUUSD Spot (matches broker)")
+    send_telegram(f"🤖 XAU BOT {VERSION}\nNo trade - Waiting for setup\nRSI BUY {BUY_RSI_MIN}-{BUY_RSI_MAX} | SELL {SELL_RSI_MIN}-{SELL_RSI_MAX}\nHTF: 1H EMA200\nTP +{TP_PIPS} / SL -{SL_PIPS} = 1:2 RR\nPrice: GC=F - $10 = Spot (matches broker)")
     while True:
         try:
             check_trade()
