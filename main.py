@@ -1,163 +1,228 @@
 import os
 import time
 import threading
-import requests
 import yfinance as yf
 import pandas as pd
 import numpy as np
 from flask import Flask
-from datetime import datetime
+from telegram import Update
+from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
 
-VERSION = "V12.1 LIVE"
-# FIX: Accept BOTH env var names
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "") or os.getenv("TELEGRAM_BOT_TOKEN", "") or os.getenv("BOT_TOKEN", "")
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "") or os.getenv("TELEGRAM_BOT_CHAT_ID", "") or os.getenv("CHAT_ID", "")
+# ===== CONFIG =====
+TOKEN = os.environ.get("TELEGRAM_TOKEN", "PASTE_YOUR_TOKEN_HERE")
+CHAT_ID = os.environ.get("CHAT_ID", "")  # optional, bot will learn from /start
+SYMBOL = "GC=F"  # Gold Futures - use for XAUUSD
 
-SYMBOL = "GC=F"
-CHECK_INTERVAL = 120
+TP_POINTS = 40
+SL_POINTS = 20
+BE_POINTS = 15
 
-BUY_RSI_MIN = 30
-BUY_RSI_MAX = 50
-SELL_RSI_MIN = 50
-SELL_RSI_MAX = 68
+RSI_PERIOD = 14
+EMA_HTF = 200
 
-TP_PIPS = 30
-SL_PIPS = 20
-BE_TRIGGER = 15
+# State
+open_trade = None
+score = {"TP": 0, "SL": 0, "BE": 0}
+last_signal_time = 0
+user_chat_id = None
 
-stats = {"tp": 0, "sl": 0, "be": 0, "last_check": "Never", "last_price": 0, "open_trade": None}
+app_flask = Flask(__name__)
 
-app = Flask(__name__)
-
-@app.route("/")
+@app_flask.route("/")
 def home():
-    return f"XAU BOT {VERSION} - Running"
+    return "Bot is running - V12.2"
 
-def send_telegram(msg):
-    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
-        print(f"Telegram skipped - Token set={bool(TELEGRAM_TOKEN)} Chat set={bool(TELEGRAM_CHAT_ID)}", flush=True)
-        return
-    try:
-        url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-        requests.post(url, json={"chat_id": TELEGRAM_CHAT_ID, "text": msg}, timeout=10)
-    except Exception as e:
-        print(f"Telegram error: {e}", flush=True)
+def run_flask():
+    port = int(os.environ.get("PORT", 10000))
+    app_flask.run(host="0.0.0.0", port=port)
 
-def get_rsi(series, period=14):
+# ===== INDICATORS =====
+def rsi_calc(series, period=14):
     delta = series.diff()
-    gain = (delta.where(delta > 0, 0)).rolling(window=period).mean()
-    loss = (-delta.where(delta < 0, 0)).rolling(window=period).mean()
+    gain = delta.where(delta > 0, 0).rolling(period).mean()
+    loss = -delta.where(delta < 0, 0).rolling(period).mean()
     rs = gain / loss
-    rsi = 100 - (100 / (1 + rs))
-    return rsi
+    return 100 - (100 / (1 + rs))
 
-def fetch_data():
-    df5 = yf.download(SYMBOL, period="2d", interval="5m", progress=False, auto_adjust=True)
-    df1h = yf.download(SYMBOL, period="10d", interval="1h", progress=False, auto_adjust=True)
-    if df5.empty or df1h.empty:
-        return None, None
-    if isinstance(df5.columns, pd.MultiIndex):
-        df5.columns = df5.columns.get_level_values(0)
-    if isinstance(df1h.columns, pd.MultiIndex):
-        df1h.columns = df1h.columns.get_level_values(0)
-    return df5, df1h
+def get_data():
+    # 15m for signals, 1H for HTF filter
+    df_15m = yf.download(SYMBOL, interval="15m", period="2d", progress=False, auto_adjust=True)
+    df_1h = yf.download(SYMBOL, interval="1h", period="5d", progress=False, auto_adjust=True)
+    if df_15m.empty or df_1h.empty:
+        return None, None, None, None
+    # flatten if multi-index
+    if isinstance(df_15m.columns, pd.MultiIndex):
+        df_15m.columns = df_15m.columns.get_level_values(0)
+    if isinstance(df_1h.columns, pd.MultiIndex):
+        df_1h.columns = df_1h.columns.get_level_values(0)
+    df_15m["RSI"] = rsi_calc(df_15m["Close"], RSI_PERIOD)
+    df_1h["EMA200"] = df_1h["Close"].ewm(span=EMA_HTF, adjust=False).mean()
+    price = float(df_15m["Close"].iloc[-1])
+    rsi = float(df_15m["RSI"].iloc[-1])
+    ema200_1h = float(df_1h["EMA200"].iloc[-1])
+    return price, rsi, ema200_1h, df_15m
 
-def check_trade():
-    df5, df1h = fetch_data()
-    if df5 is None:
-        print("No data", flush=True)
+# ===== BOT COMMANDS =====
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    global user_chat_id
+    user_chat_id = update.effective_chat.id
+    if open_trade:
+        t = open_trade
+        await update.message.reply_text(
+            f"Bot is LIVE - V12.2 ✅\n\n"
+            f"Open: {t['side']} @ {t['entry']:.2f}\n"
+            f"TP: {t['tp']:.2f} (+{TP_POINTS})\n"
+            f"SL: {t['sl']:.2f} (-{SL_POINTS})\n"
+            f"BE: {t['be']:.2f} (+{BE_POINTS})\n\n"
+            f"Score TP:{score['TP']} SL:{score['SL']} BE:{score['BE']}"
+        )
+    else:
+        await update.message.reply_text(
+            f"Bot is LIVE - V12.2 ✅\n"
+            f"No open trade. Watching Gold...\n\n"
+            f"Settings: TP +{TP_POINTS} / SL -{SL_POINTS} = 1:2 RR\n"
+            f"Score TP:{score['TP']} SL:{score['SL']} BE:{score['BE']}"
+        )
+
+async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    price, rsi, ema200, _ = get_data()
+    if price is None:
+        await update.message.reply_text("Can't fetch price right now, try again.")
         return
-    close5 = df5["Close"]
-    vol = df5["Volume"]
-    price = float(close5.iloc[-1])
-    rsi = float(get_rsi(close5, 14).iloc[-1])
-    roc = float((close5.iloc[-1] - close5.iloc[-4]) / close5.iloc[-4] * 100) if len(close5) > 4 else 0
-    vol_now = float(vol.iloc[-1]) if len(vol) > 0 else 0
-    vol_avg = float(vol.tail(20).mean()) if len(vol) > 0 else 1
-    vol_ok = vol_now >= vol_avg * 0.5
-    vol_thresh = int(vol_avg)
-    df1h["EMA200"] = df1h["Close"].ewm(span=200, adjust=False).mean()
-    ema200_1h = float(df1h["EMA200"].iloc[-1])
-    htf_buy = price > ema200_1h
-    htf_sell = price < ema200_1h
-    stats["last_check"] = datetime.utcnow().strftime("%H:%M:%S")
-    stats["last_price"] = price
-    print(f"CHECK {price:.2f} RSI {rsi:.1f} ROC {roc:.4f} VOL {int(vol_now)}/{vol_thresh} OK={vol_ok} HTF B={htf_buy} S={htf_sell}", flush=True)
+    htf = price < ema200_1h if ema200 else False
+    await update.message.reply_text(
+        f"Gold: {price:.2f}\nRSI (15m): {rsi:.1f}\n1H EMA200: {ema200:.2f}\nHTF S={htf} (Price under EMA = SELL bias)"
+    )
 
-    if stats["open_trade"]:
-        t = stats["open_trade"]
-        profit = (price - t["entry"]) if t["side"] == "BUY" else (t["entry"] - price)
-        if not t["be_done"] and profit >= BE_TRIGGER:
-            t["be_done"] = True
-            send_telegram(f"🔒 BREAKEVEN\n{t['side']} @ {t['entry']:.2f} -> BE at {price:.2f}")
-        if profit >= TP_PIPS:
-            stats["tp"] += 1
-            stats["open_trade"] = None
-            send_telegram(f"✅ TP HIT {t['side']} +{TP_PIPS}\nEntry {t['entry']:.2f} Exit {price:.2f}\nScore TP:{stats['tp']} SL:{stats['sl']} BE:{stats['be']}")
-            return
-        if profit <= -SL_PIPS or (t["be_done"] and profit <= 0):
-            if t["be_done"]:
-                stats["be"] += 1
-                send_telegram(f"🔒 BREAKEVEN CLOSED {t['side']}\nEntry {t['entry']:.2f} Exit {price:.2f} = $0")
-            else:
-                stats["sl"] += 1
-                send_telegram(f"❌ SL HIT {t['side']} -{SL_PIPS}\nEntry {t['entry']:.2f} Exit {price:.2f}\nScore TP:{stats['tp']} SL:{stats['sl']} BE:{stats['be']}")
-            stats["open_trade"] = None
-            return
-        return
-
-    buy_signal = (BUY_RSI_MIN <= rsi <= BUY_RSI_MAX) and htf_buy and vol_ok
-    sell_signal = (SELL_RSI_MIN <= rsi <= SELL_RSI_MAX) and htf_sell and vol_ok
-    if buy_signal:
-        stats["open_trade"] = {"side": "BUY", "entry": price, "be_done": False}
-        send_telegram(f"🟢 BUY SIGNAL V12.1\nPrice {price:.2f} RSI {rsi:.1f} HTF B={htf_buy}\nTP +{TP_PIPS} SL -{SL_PIPS} BE +{BE_TRIGGER}")
-    elif sell_signal:
-        stats["open_trade"] = {"side": "SELL", "entry": price, "be_done": False}
-        send_telegram(f"🔴 SELL SIGNAL V12.1\nPrice {price:.2f} RSI {rsi:.1f} HTF S={htf_sell}\nTP +{TP_PIPS} SL -{SL_PIPS} BE +{BE_TRIGGER}")
-
-def bot_loop():
-    time.sleep(5)
-    send_telegram(f"🤖 XAU BOT {VERSION}\nNo trade - Waiting for setup\nRSI BUY {BUY_RSI_MIN}-{BUY_RSI_MAX} | SELL {SELL_RSI_MIN}-{SELL_RSI_MAX}\nHTF: 1H EMA200")
+# ===== MAIN LOOP =====
+async def check_loop(app):
+    global open_trade, last_signal_time, user_chat_id
     while True:
         try:
-            check_trade()
-        except Exception as e:
-            print(f"Loop error: {e}", flush=True)
-        time.sleep(CHECK_INTERVAL)
-
-def telegram_poll():
-    offset = 0
-    while True:
-        try:
-            if not TELEGRAM_TOKEN:
-                time.sleep(10)
+            if user_chat_id is None:
+                await asyncio_sleep(10)
                 continue
-            url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/getUpdates?offset={offset}&timeout=20"
-            r = requests.get(url, timeout=30).json()
-            for upd in r.get("result", []):
-                offset = upd["update_id"] + 1
-                msg = upd.get("message", {})
-                text = msg.get("text", "")
-                if text == "/start":
-                    total = stats["tp"] + stats["sl"] + stats["be"]
-                    reply = (f"🤖 XAU BOT {VERSION}\nPrice: {stats['last_price']:.2f}\nLast: {stats['last_check']} UTC\nScore TP:{stats['tp']} SL:{stats['sl']} BE:{stats['be']} Total:{total}\nOpen: {stats['open_trade']['side'] if stats['open_trade'] else 'No trade'}")
-                    send_telegram(reply)
+
+            price, rsi, ema200, _ = get_data()
+            if price is None:
+                await asyncio_sleep(30)
+                continue
+
+            htf_sell = price < ema200  # Price under 1H EMA200
+            htf_buy = price > ema200
+
+            # --- If trade is OPEN, check TP / SL / BE ---
+            if open_trade:
+                t = open_trade
+                # BE logic: if +15 reached, move SL to entry
+                if not t["be_done"]:
+                    if t["side"] == "SELL" and price <= t["entry"] - BE_POINTS:
+                        t["sl"] = t["entry"]
+                        t["be_done"] = True
+                    if t["side"] == "BUY" and price >= t["entry"] + BE_POINTS:
+                        t["sl"] = t["entry"]
+                        t["be_done"] = True
+
+                # Check TP / SL
+                closed = None
+                if t["side"] == "SELL":
+                    if price <= t["tp"]:
+                        closed = "TP"
+                    elif price >= t["sl"]:
+                        closed = "BE" if t["be_done"] else "SL"
+                else:  # BUY
+                    if price >= t["tp"]:
+                        closed = "TP"
+                    elif price <= t["sl"]:
+                        closed = "BE" if t["be_done"] else "SL"
+
+                if closed:
+                    score[closed] += 1
+                    if closed == "TP":
+                        emoji = "✅"
+                        txt = f"{emoji} TP HIT {t['side']} +{TP_POINTS}\nEntry {t['entry']:.2f} Exit {price:.2f}\nScore TP:{score['TP']} SL:{score['SL']} BE:{score['BE']}"
+                    elif closed == "SL":
+                        emoji = "❌"
+                        txt = f"{emoji} SL HIT {t['side']} -{SL_POINTS}\nEntry {t['entry']:.2f} Exit {price:.2f}\nScore TP:{score['TP']} SL:{score['SL']} BE:{score['BE']}"
+                    else:
+                        txt = f"🔒 BREAKEVEN CLOSED {t['side']}\nEntry {t['entry']:.2f} Exit {price:.2f}\nScore TP:{score['TP']} SL:{score['SL']} BE:{score['BE']}"
+                    await app.bot.send_message(chat_id=user_chat_id, text=txt)
+                    open_trade = None
+
+                await asyncio_sleep(30)
+                continue
+
+            # --- No open trade, look for new signal ---
+            # Prevent spam: only 1 signal per 15 min candle
+            now = time.time()
+            if now - last_signal_time < 900:
+                await asyncio_sleep(30)
+                continue
+
+            signal = None
+            # SELL: RSI 50-68 + Price under 1H EMA200
+            if 50 <= rsi <= 68 and htf_sell:
+                signal = "SELL"
+            # BUY: RSI 32-50 + Price above 1H EMA200
+            elif 32 <= rsi <= 50 and htf_buy:
+                signal = "BUY"
+
+            if signal:
+                last_signal_time = now
+                entry = price
+                if signal == "SELL":
+                    tp_price = entry - TP_POINTS
+                    sl_price = entry + SL_POINTS
+                    be_price = entry - BE_POINTS
+                    emoji = "🔴"
+                else:
+                    tp_price = entry + TP_POINTS
+                    sl_price = entry - SL_POINTS
+                    be_price = entry + BE_POINTS
+                    emoji = "🟢"
+
+                open_trade = {
+                    "side": signal,
+                    "entry": entry,
+                    "tp": tp_price,
+                    "sl": sl_price,
+                    "be": be_price,
+                    "be_done": False,
+                }
+
+                msg = (
+                    f"{emoji} {signal} @ {entry:.2f}\n"
+                    f"TP: {tp_price:.2f} (+{TP_POINTS})\n"
+                    f"SL: {sl_price:.2f} (-{SL_POINTS})\n"
+                    f"BE: {be_price:.2f} (+{BE_POINTS} then to breakeven)\n"
+                    f"RSI {rsi:.1f} | HTF S={htf_sell}"
+                )
+                await app.bot.send_message(chat_id=user_chat_id, text=msg)
+
+            await asyncio_sleep(30)
+
         except Exception as e:
-            print(f"Poll error: {e}", flush=True)
-        time.sleep(2)
+            print(f"Loop error: {e}")
+            await asyncio_sleep(30)
 
-_bot_started = False
-def start_bot():
-    global _bot_started
-    if _bot_started:
-        return
-    _bot_started = True
-    threading.Thread(target=bot_loop, daemon=True).start()
-    threading.Thread(target=telegram_poll, daemon=True).start()
-    print("BOT THREADS STARTED", flush=True)
+async def asyncio_sleep(sec):
+    import asyncio
+    await asyncio.sleep(sec)
 
-start_bot()
+def main():
+    threading.Thread(target=run_flask, daemon=True).start()
+    app = ApplicationBuilder().token(TOKEN).build()
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("status", status))
+
+    # Start checker in background after bot starts
+    async def post_init(app):
+        import asyncio
+        asyncio.create_task(check_loop(app))
+    app.post_init = post_init
+
+    print("Starting V12.2 Bot...")
+    app.run_polling()
 
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 10000))
-    app.run(host="0.0.0.0", port=port)
+    main()
