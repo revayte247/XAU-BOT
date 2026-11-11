@@ -9,8 +9,9 @@ from flask import Flask
 from datetime import datetime
 
 VERSION = "V12.1 LIVE"
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "")
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
+# FIX: Accept BOTH env var names
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "") or os.getenv("TELEGRAM_BOT_TOKEN", "") or os.getenv("BOT_TOKEN", "")
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "") or os.getenv("TELEGRAM_BOT_CHAT_ID", "") or os.getenv("CHAT_ID", "")
 
 SYMBOL = "GC=F"
 CHECK_INTERVAL = 120
@@ -34,6 +35,7 @@ def home():
 
 def send_telegram(msg):
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
+        print(f"Telegram skipped - Token set={bool(TELEGRAM_TOKEN)} Chat set={bool(TELEGRAM_CHAT_ID)}", flush=True)
         return
     try:
         url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
@@ -144,7 +146,6 @@ def telegram_poll():
             print(f"Poll error: {e}", flush=True)
         time.sleep(2)
 
-# --- FIX: Start threads on import, so gunicorn also starts them ---
 _bot_started = False
 def start_bot():
     global _bot_started
